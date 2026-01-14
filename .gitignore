@@ -132,8 +132,10 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Datalake
+# Datalake and Results
+datalake/*
 datalake/datasets/*
-!datalake/datasets/.gitkeep
+!datalake/datasets/readme.md
 datalake/ocr-datasets/*
-!datalake/ocr-datasets/.gitkeep
+!datalake/ocr-datasets/readme.md
+results/*

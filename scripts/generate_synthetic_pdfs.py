@@ -39,11 +39,11 @@ except ImportError:
 # Configuration
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 MIN_SOURCES = 1
-MAX_SOURCES = 5
+MAX_SOURCES = 2
 MIN_PAGES = 1
-MAX_PAGES = 50
-NUM_DOCUMENTS = 10
-VERSION = "v0.0.1"
+MAX_PAGES = 10
+NUM_DOCUMENTS = 2
+VERSION = "v0.0.0"
 
 
 def get_project_root() -> Path:
@@ -180,27 +180,47 @@ def select_images_from_sources(
     return selected_images
 
 
-def load_image_with_pillow(img_path: Path) -> bytes:
+def load_image_with_pillow(img_path: Path) -> Tuple[bytes, Tuple[int, int]]:
     """
-    Load an image using Pillow and convert to PNG bytes.
+    Load an image using Pillow preserving the original format when possible.
 
     This handles images with incorrect extensions (e.g., WebP saved as .jpg).
+    Preserves the original format to minimize modifications and optimize size.
 
     Args:
         img_path: Path to the image file
 
     Returns:
-        PNG image bytes
+        Tuple of (image bytes, image dimensions)
     """
     with Image.open(img_path) as pil_img:
-        # Convert to RGB if necessary (handles RGBA, P, etc.)
-        if pil_img.mode in ("RGBA", "P"):
-            pil_img = pil_img.convert("RGB")
+        original_format = pil_img.format  # Detect actual format (not extension)
+        size = pil_img.size
 
-        # Save to bytes as PNG
+        # Convert to RGB if necessary for JPEG output (handles RGBA, P, etc.)
+        if pil_img.mode in ("RGBA", "P", "LA"):
+            # For formats that don't support transparency well in PDF, use PNG
+            if original_format in ("PNG", "WEBP") and pil_img.mode == "RGBA":
+                output_format = "PNG"
+            else:
+                pil_img = pil_img.convert("RGB")
+                output_format = original_format if original_format in ("JPEG", "PNG") else "PNG"
+        else:
+            output_format = original_format if original_format in ("JPEG", "PNG", "TIFF") else "PNG"
+
         buffer = io.BytesIO()
-        pil_img.save(buffer, format="PNG")
-        return buffer.getvalue(), pil_img.size
+
+        if output_format == "JPEG":
+            # Preserve JPEG with high quality
+            pil_img.save(buffer, format="JPEG", quality=95, optimize=True)
+        elif output_format == "TIFF":
+            # Convert TIFF to PNG for better PDF compatibility
+            pil_img.save(buffer, format="PNG", optimize=True, compress_level=9)
+        else:
+            # PNG with maximum compression
+            pil_img.save(buffer, format="PNG", optimize=True, compress_level=9)
+
+        return buffer.getvalue(), size
 
 
 def create_pdf_from_images(
@@ -271,9 +291,14 @@ def create_pdf_from_images(
             print(f"  Warning: Could not process image {img_path}: {e}")
             continue
 
-    # Save the PDF
+    # Save the PDF with compression optimizations
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(output_path))
+    doc.save(
+        str(output_path),
+        deflate=True,      # Use deflate compression for streams
+        garbage=4,         # Maximum garbage collection
+        clean=True,        # Clean and sanitize content
+    )
     doc.close()
 
     return metadata
