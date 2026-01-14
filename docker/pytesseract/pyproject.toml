@@ -7,4 +7,5 @@ dependencies = [
     "pytesseract==0.3.10",
     "pillow==10.4.0",
     "psutil==6.0.0",
+    "pdf2image==1.17.0",
 ]
