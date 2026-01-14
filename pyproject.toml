@@ -1,0 +1,12 @@
+[project]
+name = "tesseract-benchmark-scripts"
+version = "0.1.0"
+description = "Scripts for Tesseract OCR benchmark suite"
+requires-python = ">=3.11"
+dependencies = [
+    "PyMuPDF>=1.24.0",
+    "Pillow>=10.0.0",
+]
+
+[tool.uv]
+dev-dependencies = []
