@@ -10,8 +10,9 @@ import time
 import json
 import psutil
 import threading
+from collections import defaultdict
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 
@@ -29,6 +30,24 @@ class ResourceSample:
 
 
 @dataclass
+class PageMetrics:
+    """Resource metrics for a single page."""
+    page_number: int
+    start_timestamp: float
+    end_timestamp: float
+    processing_time_ms: float
+    width: int
+    height: int
+    text_length: int
+    # Correlated resource metrics (populated after processing)
+    peak_cpu_percent: Optional[float] = None
+    avg_cpu_percent: Optional[float] = None
+    peak_memory_mb: Optional[float] = None
+    avg_memory_mb: Optional[float] = None
+    sample_count: int = 0
+
+
+@dataclass
 class OCRResult:
     filename: str
     file_size_kb: float
@@ -39,6 +58,15 @@ class OCRResult:
     success: bool
     page_count: int = 1
     error: Optional[str] = None
+    page_metrics: Optional[List["PageMetrics"]] = None
+
+
+@dataclass
+class FileAverage:
+    filename: str
+    avg_time_per_page_ms: float
+    total_pages: int
+    iterations: int
 
 
 @dataclass
@@ -57,6 +85,7 @@ class BenchmarkResult:
     peak_memory_mb: float
     avg_cpu_percent: float
     avg_memory_mb: float
+    avg_time_per_page: List[FileAverage]
 
 
 class ResourceMonitor:
@@ -107,6 +136,33 @@ def get_tesseract_version() -> str:
         return "unknown"
 
 
+def correlate_samples_with_pages(
+    ocr_results: List[OCRResult],
+    samples: List[ResourceSample]
+) -> None:
+    """Correlate resource samples with page timestamps to get per-page metrics."""
+    if not samples:
+        return
+
+    for result in ocr_results:
+        if not result.page_metrics:
+            continue
+
+        for page in result.page_metrics:
+            # Find samples within the page's time window
+            matching_samples = [
+                s for s in samples
+                if page.start_timestamp <= s.timestamp <= page.end_timestamp
+            ]
+
+            if matching_samples:
+                page.sample_count = len(matching_samples)
+                page.peak_cpu_percent = max(s.cpu_percent for s in matching_samples)
+                page.avg_cpu_percent = sum(s.cpu_percent for s in matching_samples) / len(matching_samples)
+                page.peak_memory_mb = max(s.memory_mb for s in matching_samples)
+                page.avg_memory_mb = sum(s.memory_mb for s in matching_samples) / len(matching_samples)
+
+
 def process_file(file_path: Path, lang: str = "eng") -> OCRResult:
     """Process a single file (image or PDF) and return OCR result with timing."""
     filename = file_path.name
@@ -123,12 +179,25 @@ def process_file(file_path: Path, lang: str = "eng") -> OCRResult:
         img = Image.open(file_path)
         width, height = img.size
 
-        # Run OCR with timing
-        start_time = time.perf_counter()
+        # Run OCR with timing (use time.time() for correlation with samples)
+        start_timestamp = time.time()
+        start_perf = time.perf_counter()
         text = pytesseract.image_to_string(img, lang=lang)
-        end_time = time.perf_counter()
+        end_perf = time.perf_counter()
+        end_timestamp = time.time()
 
-        processing_time_ms = (end_time - start_time) * 1000
+        processing_time_ms = (end_perf - start_perf) * 1000
+
+        # Create page metrics for single image
+        page_metrics = [PageMetrics(
+            page_number=1,
+            start_timestamp=start_timestamp,
+            end_timestamp=end_timestamp,
+            processing_time_ms=processing_time_ms,
+            width=width,
+            height=height,
+            text_length=len(text)
+        )]
 
         return OCRResult(
             filename=filename,
@@ -138,7 +207,8 @@ def process_file(file_path: Path, lang: str = "eng") -> OCRResult:
             processing_time_ms=processing_time_ms,
             text_length=len(text),
             success=True,
-            page_count=1
+            page_count=1,
+            page_metrics=page_metrics
         )
 
     except Exception as e:
@@ -175,9 +245,12 @@ def process_pdf(pdf_path: Path, lang: str, file_size_kb: float) -> OCRResult:
         all_text = []
         max_width = 0
         max_height = 0
+        page_metrics_list: List[PageMetrics] = []
 
         ocr_loop_start = time.perf_counter()
         for page_num, img in enumerate(images, 1):
+            # Record timestamps for correlation
+            page_start_timestamp = time.time()
             page_start = time.perf_counter()
 
             width, height = img.size
@@ -189,8 +262,20 @@ def process_pdf(pdf_path: Path, lang: str, file_size_kb: float) -> OCRResult:
             all_text.append(text)
 
             page_end = time.perf_counter()
+            page_end_timestamp = time.time()
             page_time_ms = (page_end - page_start) * 1000
             print(f"     [page {page_num}: {page_time_ms:.0f}ms]")
+
+            # Store page metrics
+            page_metrics_list.append(PageMetrics(
+                page_number=page_num,
+                start_timestamp=page_start_timestamp,
+                end_timestamp=page_end_timestamp,
+                processing_time_ms=page_time_ms,
+                width=width,
+                height=height,
+                text_length=len(text)
+            ))
 
         ocr_loop_end = time.perf_counter()
         ocr_loop_time_ms = (ocr_loop_end - ocr_loop_start) * 1000
@@ -209,7 +294,8 @@ def process_pdf(pdf_path: Path, lang: str, file_size_kb: float) -> OCRResult:
             processing_time_ms=processing_time_ms,
             text_length=len(combined_text),
             success=True,
-            page_count=page_count
+            page_count=page_count,
+            page_metrics=page_metrics_list
         )
 
     except Exception as e:
@@ -234,8 +320,8 @@ def run_benchmark(
 ) -> BenchmarkResult:
     """Run the full benchmark suite."""
     
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    start_time = datetime.now()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    start_time = datetime.now(timezone.utc)
     
     print(f"[Benchmark] Starting run: {run_id}")
     print(f"[Benchmark] Tesseract version: {get_tesseract_version()}")
@@ -278,12 +364,15 @@ def run_benchmark(
     
     # Stop monitoring
     monitor.stop()
-    
-    end_time = datetime.now()
+
+    end_time = datetime.now(timezone.utc)
     total_duration = (end_time - start_time).total_seconds()
-    
+
     # Calculate statistics
     samples = monitor.samples
+
+    # Correlate resource samples with page timestamps
+    correlate_samples_with_pages(ocr_results, samples)
     
     if samples:
         peak_cpu = max(s.cpu_percent for s in samples)
@@ -295,11 +384,29 @@ def run_benchmark(
     
     files_processed = sum(1 for r in ocr_results if r.success)
     files_failed = sum(1 for r in ocr_results if not r.success)
-    
+
+    # Calculate average time per page for each file across iterations
+    file_times: dict = defaultdict(list)
+    for r in ocr_results:
+        if r.success and r.page_count > 0:
+            time_per_page = r.processing_time_ms / r.page_count
+            file_times[r.filename].append((time_per_page, r.page_count))
+
+    avg_time_per_page: List[FileAverage] = []
+    for filename, times in file_times.items():
+        avg_time = sum(t[0] for t in times) / len(times)
+        total_pages = times[0][1]  # page_count is same across iterations
+        avg_time_per_page.append(FileAverage(
+            filename=filename,
+            avg_time_per_page_ms=avg_time,
+            total_pages=total_pages,
+            iterations=len(times)
+        ))
+
     result = BenchmarkResult(
         run_id=run_id,
-        start_time=start_time.isoformat(),
-        end_time=end_time.isoformat(),
+        start_time=start_time.isoformat(timespec='seconds'),
+        end_time=end_time.isoformat(timespec='seconds'),
         total_duration_s=total_duration,
         engine="pytesseract",
         tesseract_version=get_tesseract_version(),
@@ -310,7 +417,8 @@ def run_benchmark(
         peak_cpu_percent=peak_cpu,
         peak_memory_mb=peak_memory,
         avg_cpu_percent=avg_cpu,
-        avg_memory_mb=avg_memory
+        avg_memory_mb=avg_memory,
+        avg_time_per_page=[asdict(a) for a in avg_time_per_page]
     )
     
     # Save results
