@@ -133,10 +133,20 @@ mkdir -p "$OUTPUT_DIR"
 
 # Step 4: Run the benchmark container
 log_info "Running benchmark container..."
-docker run \
+# docker run \
+#     -v "$DATASET_DIR:/app/input:ro" \
+#     -v "$OUTPUT_DIR:/app/output" \
+#     -e "ITERATIONS=$ITERATIONS" \
+#     "$IMAGE_NAME"
+docker run --rm \
     -v "$DATASET_DIR:/app/input:ro" \
     -v "$OUTPUT_DIR:/app/output" \
+    -e PDF_BATCH_SIZE=3 \
+    -e PDF_RENDER_WORKERS=3 \
+    -e PDF_DPI=200 \
     -e "ITERATIONS=$ITERATIONS" \
+    --memory="3072m" \
+    --cpus="3.0" \
     "$IMAGE_NAME"
 
 log_info "Benchmark complete!"

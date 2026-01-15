@@ -225,61 +225,173 @@ def process_file(file_path: Path, lang: str = "eng") -> OCRResult:
         )
 
 
+# def process_pdf(pdf_path: Path, lang: str, file_size_kb: float) -> OCRResult:
+#     """Process a PDF file page by page and return aggregated OCR result."""
+#     filename = pdf_path.name
+
+#     try:
+#         start_time = time.perf_counter()
+
+#         # Convert PDF to images
+#         convert_start = time.perf_counter()
+#         images = convert_from_path(pdf_path)
+#         convert_end = time.perf_counter()
+#         convert_time_ms = (convert_end - convert_start) * 1000
+#         print(f"     [pdf2image: {convert_time_ms:.1f}ms]")
+
+#         page_count = len(images)
+
+#         # Process each page
+#         all_text = []
+#         max_width = 0
+#         max_height = 0
+#         page_metrics_list: List[PageMetrics] = []
+
+#         ocr_loop_start = time.perf_counter()
+#         for page_num, img in enumerate(images, 1):
+#             # Record timestamps for correlation
+#             page_start_timestamp = time.time()
+#             page_start = time.perf_counter()
+
+#             width, height = img.size
+#             max_width = max(max_width, width)
+#             max_height = max(max_height, height)
+
+#             # Run OCR on page
+#             text = pytesseract.image_to_string(img, lang=lang)
+#             all_text.append(text)
+
+#             page_end = time.perf_counter()
+#             page_end_timestamp = time.time()
+#             page_time_ms = (page_end - page_start) * 1000
+#             print(f"     [page {page_num}: {page_time_ms:.0f}ms]")
+
+#             # Store page metrics
+#             page_metrics_list.append(PageMetrics(
+#                 page_number=page_num,
+#                 start_timestamp=page_start_timestamp,
+#                 end_timestamp=page_end_timestamp,
+#                 processing_time_ms=page_time_ms,
+#                 width=width,
+#                 height=height,
+#                 text_length=len(text)
+#             ))
+
+#         ocr_loop_end = time.perf_counter()
+#         ocr_loop_time_ms = (ocr_loop_end - ocr_loop_start) * 1000
+#         print(f"     [OCR total: {ocr_loop_time_ms:.1f}ms]")
+
+#         end_time = time.perf_counter()
+#         processing_time_ms = (end_time - start_time) * 1000
+
+#         combined_text = "\n\n".join(all_text)
+
+#         return OCRResult(
+#             filename=filename,
+#             file_size_kb=file_size_kb,
+#             image_width=max_width,
+#             image_height=max_height,
+#             processing_time_ms=processing_time_ms,
+#             text_length=len(combined_text),
+#             success=True,
+#             page_count=page_count,
+#             page_metrics=page_metrics_list
+#         )
+
+#     except Exception as e:
+#         return OCRResult(
+#             filename=filename,
+#             file_size_kb=file_size_kb,
+#             image_width=0,
+#             image_height=0,
+#             processing_time_ms=0,
+#             text_length=0,
+#             success=False,
+#             page_count=0,
+#             error=str(e)
+#         )
+
 def process_pdf(pdf_path: Path, lang: str, file_size_kb: float) -> OCRResult:
-    """Process a PDF file page by page and return aggregated OCR result."""
+    """Process a PDF file in batches and return aggregated OCR result."""
     filename = pdf_path.name
 
+    # Configuration from environment (matching production settings)
+    batch_size = int(os.environ.get("PDF_BATCH_SIZE", "3"))  # pages per batch
+    render_workers = int(os.environ.get("PDF_RENDER_WORKERS", "3"))  # poppler threads
+    dpi = int(os.environ.get("PDF_DPI", "200"))  # lower DPI = less memory
+
     try:
+        from pdf2image.pdf2image import pdfinfo_from_path
+        
         start_time = time.perf_counter()
 
-        # Convert PDF to images
-        convert_start = time.perf_counter()
-        images = convert_from_path(pdf_path)
-        convert_end = time.perf_counter()
-        convert_time_ms = (convert_end - convert_start) * 1000
-        print(f"     [pdf2image: {convert_time_ms:.1f}ms]")
+        # Get page count WITHOUT loading images
+        pdf_info = pdfinfo_from_path(pdf_path)
+        page_count = pdf_info["Pages"]
+        print(f"     [PDF: {page_count} pages, batch_size={batch_size}, workers={render_workers}, dpi={dpi}]")
 
-        page_count = len(images)
-
-        # Process each page
+        # Process in batches
         all_text = []
         max_width = 0
         max_height = 0
         page_metrics_list: List[PageMetrics] = []
 
         ocr_loop_start = time.perf_counter()
-        for page_num, img in enumerate(images, 1):
-            # Record timestamps for correlation
-            page_start_timestamp = time.time()
-            page_start = time.perf_counter()
+        
+        for batch_start in range(1, page_count + 1, batch_size):
+            batch_end = min(batch_start + batch_size - 1, page_count)
+            
+            # Convert batch of pages
+            convert_start = time.perf_counter()
+            images = convert_from_path(
+                pdf_path,
+                dpi=dpi,
+                first_page=batch_start,
+                last_page=batch_end,
+                fmt="png",
+                thread_count=render_workers,
+            )
+            convert_end = time.perf_counter()
+            convert_time_ms = (convert_end - convert_start) * 1000
+            print(f"     [batch {batch_start}-{batch_end}: convert {convert_time_ms:.0f}ms]")
 
-            width, height = img.size
-            max_width = max(max_width, width)
-            max_height = max(max_height, height)
+            # Process each page in batch
+            for idx, img in enumerate(images):
+                page_num = batch_start + idx
+                
+                page_start_timestamp = time.time()
+                page_start = time.perf_counter()
 
-            # Run OCR on page
-            text = pytesseract.image_to_string(img, lang=lang)
-            all_text.append(text)
+                width, height = img.size
+                max_width = max(max_width, width)
+                max_height = max(max_height, height)
 
-            page_end = time.perf_counter()
-            page_end_timestamp = time.time()
-            page_time_ms = (page_end - page_start) * 1000
-            print(f"     [page {page_num}: {page_time_ms:.0f}ms]")
+                # Run OCR on page
+                text = pytesseract.image_to_string(img, lang=lang)
+                all_text.append(text)
 
-            # Store page metrics
-            page_metrics_list.append(PageMetrics(
-                page_number=page_num,
-                start_timestamp=page_start_timestamp,
-                end_timestamp=page_end_timestamp,
-                processing_time_ms=page_time_ms,
-                width=width,
-                height=height,
-                text_length=len(text)
-            ))
+                page_end = time.perf_counter()
+                page_end_timestamp = time.time()
+                page_time_ms = (page_end - page_start) * 1000
+                
+                print(f"       [page {page_num}: {page_time_ms:.0f}ms]")
+
+                page_metrics_list.append(PageMetrics(
+                    page_number=page_num,
+                    start_timestamp=page_start_timestamp,
+                    end_timestamp=page_end_timestamp,
+                    processing_time_ms=page_time_ms,
+                    width=width,
+                    height=height,
+                    text_length=len(text)
+                ))
+
+            # FREE MEMORY after each batch
+            del images
 
         ocr_loop_end = time.perf_counter()
         ocr_loop_time_ms = (ocr_loop_end - ocr_loop_start) * 1000
-        print(f"     [OCR total: {ocr_loop_time_ms:.1f}ms]")
+        print(f"     [Total: {ocr_loop_time_ms:.1f}ms]")
 
         end_time = time.perf_counter()
         processing_time_ms = (end_time - start_time) * 1000
