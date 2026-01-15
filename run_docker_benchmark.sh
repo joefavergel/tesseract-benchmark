@@ -9,6 +9,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Default values
 DATASET_VERSION="v0.0.1"
 ITERATIONS=3
+SINGLE_THREAD=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -25,12 +26,14 @@ usage() {
     echo "Options:"
     echo "  -d, --dataset VERSION   Dataset version to use (default: $DATASET_VERSION)"
     echo "  -i, --iterations N      Number of iterations per file (default: $ITERATIONS)"
+    echo "  -s, --single-thread     Limit Tesseract to single thread (OMP_THREAD_LIMIT=1)"
     echo "  -h, --help              Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0 pytesseract"
     echo "  $0 native -d v0.1.0"
     echo "  $0 pytesseract -d v0.0.1 -i 5"
+    echo "  $0 pytesseract -s                    # Single-thread mode (reduces CPU usage)"
     exit 1
 }
 
@@ -63,6 +66,10 @@ while [[ $# -gt 0 ]]; do
         -i|--iterations)
             ITERATIONS="$2"
             shift 2
+            ;;
+        -s|--single-thread)
+            SINGLE_THREAD=true
+            shift
             ;;
         -h|--help)
             usage
@@ -100,6 +107,7 @@ log_info "Configuration:"
 echo "  Image type:      $IMAGE_TYPE"
 echo "  Dataset version: $DATASET_VERSION"
 echo "  Iterations:      $ITERATIONS"
+echo "  Single-thread:   $SINGLE_THREAD"
 echo "  Input dir:       $DATASET_DIR"
 echo "  Output dir:      $OUTPUT_DIR"
 echo ""
@@ -133,18 +141,24 @@ mkdir -p "$OUTPUT_DIR"
 
 # Step 4: Run the benchmark container
 log_info "Running benchmark container..."
-# docker run \
-#     -v "$DATASET_DIR:/app/input:ro" \
-#     -v "$OUTPUT_DIR:/app/output" \
-#     -e "ITERATIONS=$ITERATIONS" \
-#     "$IMAGE_NAME"
+
+# Build docker run command with optional OMP_THREAD_LIMIT
+DOCKER_ENV_ARGS=(
+    -e PDF_BATCH_SIZE=3
+    -e PDF_RENDER_WORKERS=3
+    -e PDF_DPI=200
+    -e "ITERATIONS=$ITERATIONS"
+)
+
+if [ "$SINGLE_THREAD" = true ]; then
+    log_info "Single-thread mode enabled (OMP_THREAD_LIMIT=1)"
+    DOCKER_ENV_ARGS+=(-e OMP_THREAD_LIMIT=1)
+fi
+
 docker run --rm \
     -v "$DATASET_DIR:/app/input:ro" \
     -v "$OUTPUT_DIR:/app/output" \
-    -e PDF_BATCH_SIZE=3 \
-    -e PDF_RENDER_WORKERS=3 \
-    -e PDF_DPI=200 \
-    -e "ITERATIONS=$ITERATIONS" \
+    "${DOCKER_ENV_ARGS[@]}" \
     --memory="3072m" \
     --cpus="3.0" \
     "$IMAGE_NAME"
