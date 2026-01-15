@@ -147,9 +147,14 @@ process_image() {
 
 # Function to process a PDF file using Poppler (pdftoppm)
 # This matches pdf2image which pytesseract uses
+# Uses batch processing to avoid memory overload (matching Python implementation)
 process_pdf() {
     local pdf_path="$1"
     local filename=$(basename "$pdf_path")
+
+    # Configuration from environment (matching Python/production settings)
+    local batch_size="${PDF_BATCH_SIZE:-3}"
+    local dpi="${PDF_DPI:-200}"
 
     # Get file info (use stat for exact bytes, divide for float KB like Python)
     local file_size_bytes=$(stat -c%s "$pdf_path" 2>/dev/null || stat -f%z "$pdf_path" 2>/dev/null)
@@ -161,82 +166,95 @@ process_pdf() {
 
     local ocr_start=$(date +%s.%N)
 
-    # Convert PDF to images using pdftoppm (same as pdf2image uses)
-    # Using PPM format (uncompressed) and 200 DPI to match pdf2image defaults
-    # PPM is much faster than PNG since no compression is needed
-    local convert_start=$(date +%s.%N)
-    if ! pdftoppm -r 200 "$pdf_path" "${page_dir}/page" 2>/dev/null; then
+    # Get page count WITHOUT loading images (like Python's pdfinfo_from_path)
+    local page_count=$(pdfinfo "$pdf_path" 2>/dev/null | grep -i "^Pages:" | awk '{print $2}')
+    if [ -z "$page_count" ] || [ "$page_count" -eq 0 ]; then
         local ocr_end=$(date +%s.%N)
         local processing_time=$(echo "scale=3; ($ocr_end - $ocr_start) * 1000" | bc)
-        echo "  -> FAILED: PDF conversion error"
-        append_ocr_result "$filename" "$file_size_kb" "0" "0" "$processing_time" "0" "false" "0" "PDF to image conversion failed"
-        rm -rf "$page_dir"
-        return
-    fi
-    local convert_end=$(date +%s.%N)
-    local convert_time=$(echo "scale=1; ($convert_end - $convert_start) * 1000" | bc)
-    echo "     [pdftoppm: ${convert_time}ms]"
-
-    # Get list of generated page images (sorted) into an array
-    # pdftoppm outputs as page-1.ppm, page-2.ppm, etc. (PPM format)
-    local page_images=()
-    while IFS= read -r img; do
-        [ -n "$img" ] && page_images+=("$img")
-    done < <(find "$page_dir" -name "page-*.ppm" | sort -V)
-
-    local page_count=${#page_images[@]}
-
-    if [ "$page_count" -eq 0 ]; then
-        local ocr_end=$(date +%s.%N)
-        local processing_time=$(echo "scale=3; ($ocr_end - $ocr_start) * 1000" | bc)
-        echo "  -> FAILED: No pages extracted"
-        append_ocr_result "$filename" "$file_size_kb" "0" "0" "$processing_time" "0" "false" "0" "No pages extracted from PDF"
+        echo "  -> FAILED: Could not get PDF page count"
+        append_ocr_result "$filename" "$file_size_kb" "0" "0" "$processing_time" "0" "false" "0" "Could not get PDF page count"
         rm -rf "$page_dir"
         return
     fi
 
-    # Process each page and collect results
+    echo "     [PDF: ${page_count} pages, batch_size=${batch_size}, dpi=${dpi}]"
+
+    # Process in batches (matching Python implementation)
     local max_width=0
     local max_height=0
     local text_file="${page_dir}/.all_text"
-    local page_text_lengths_file="${page_dir}/.page_lengths"
     > "$text_file"  # Create/truncate file
-    > "$page_text_lengths_file"
 
     local ocr_loop_start=$(date +%s.%N)
-    local page_num=0
-    for page_image in "${page_images[@]}"; do
-        page_num=$((page_num + 1))
-        # Record timestamps for correlation
-        local page_start=$(date +%s.%N)
+    local batch_start=1
 
-        # Get page dimensions from PPM header (much faster than ImageMagick identify)
-        # PPM format: "P6\n[comments]\nwidth height\nmaxval\n" followed by binary data
-        # Skip comment lines (starting with #) and get first line with two numbers
-        local dimensions=$(head -c 200 "$page_image" | tr '\0' '\n' | grep -v '^#' | grep -v '^P' | head -1)
-        local width=$(echo "$dimensions" | awk '{print $1}')
-        local height=$(echo "$dimensions" | awk '{print $2}')
+    while [ "$batch_start" -le "$page_count" ]; do
+        local batch_end=$((batch_start + batch_size - 1))
+        [ "$batch_end" -gt "$page_count" ] && batch_end=$page_count
 
-        # Track max dimensions
-        [ "$width" -gt "$max_width" ] && max_width=$width
-        [ "$height" -gt "$max_height" ] && max_height=$height
+        # Convert batch of pages using pdftoppm with -f (first) and -l (last)
+        local convert_start=$(date +%s.%N)
+        if ! pdftoppm -r "$dpi" -f "$batch_start" -l "$batch_end" "$pdf_path" "${page_dir}/page" 2>/dev/null; then
+            local ocr_end=$(date +%s.%N)
+            local processing_time=$(echo "scale=3; ($ocr_end - $ocr_start) * 1000" | bc)
+            echo "  -> FAILED: PDF conversion error at batch ${batch_start}-${batch_end}"
+            append_ocr_result "$filename" "$file_size_kb" "0" "0" "$processing_time" "0" "false" "0" "PDF to image conversion failed"
+            rm -rf "$page_dir"
+            return
+        fi
+        local convert_end=$(date +%s.%N)
+        local convert_time=$(echo "scale=0; ($convert_end - $convert_start) * 1000" | bc)
+        echo "     [batch ${batch_start}-${batch_end}: convert ${convert_time}ms]"
 
-        # Run OCR on page, capture output for length measurement
-        local page_text=$(tesseract "$page_image" stdout -l "$OCR_LANG" 2>/dev/null)
-        echo "$page_text" >> "$text_file"
-        echo "" >> "$text_file"
-        local page_text_length=${#page_text}
+        # Get list of generated page images for this batch (sorted)
+        local page_images=()
+        while IFS= read -r img; do
+            [ -n "$img" ] && page_images+=("$img")
+        done < <(find "$page_dir" -name "page-*.ppm" | sort -V)
 
-        local page_end=$(date +%s.%N)
-        local page_time=$(echo "scale=3; ($page_end - $page_start) * 1000" | bc)
-        echo "     [page $page_num: ${page_time%.000}ms]"
+        # Process each page in batch
+        local idx=0
+        for page_image in "${page_images[@]}"; do
+            local page_num=$((batch_start + idx))
+            idx=$((idx + 1))
 
-        # Track page metrics with timestamps for resource correlation
-        echo "$OCR_RESULT_INDEX,$filename,$page_num,$page_start,$page_end,$page_time,$width,$height,$page_text_length" >> "$PAGE_METRICS_FILE"
+            # Record timestamps for correlation
+            local page_start=$(date +%s.%N)
+
+            # Get page dimensions from PPM header (much faster than ImageMagick identify)
+            # PPM format: "P6\n[comments]\nwidth height\nmaxval\n" followed by binary data
+            local dimensions=$(head -c 200 "$page_image" | tr '\0' '\n' | grep -v '^#' | grep -v '^P' | head -1)
+            local width=$(echo "$dimensions" | awk '{print $1}')
+            local height=$(echo "$dimensions" | awk '{print $2}')
+
+            # Track max dimensions
+            [ "$width" -gt "$max_width" ] && max_width=$width
+            [ "$height" -gt "$max_height" ] && max_height=$height
+
+            # Run OCR on page, capture output for length measurement
+            local page_text=$(tesseract "$page_image" stdout -l "$OCR_LANG" 2>/dev/null)
+            echo "$page_text" >> "$text_file"
+            echo "" >> "$text_file"
+            local page_text_length=${#page_text}
+
+            local page_end=$(date +%s.%N)
+            local page_time=$(echo "scale=0; ($page_end - $page_start) * 1000" | bc)
+            echo "       [page ${page_num}: ${page_time}ms]"
+
+            # Track page metrics with timestamps for resource correlation
+            echo "$OCR_RESULT_INDEX,$filename,$page_num,$page_start,$page_end,$page_time,$width,$height,$page_text_length" >> "$PAGE_METRICS_FILE"
+        done
+
+        # FREE MEMORY after each batch (delete batch images)
+        rm -f "${page_dir}"/page-*.ppm
+
+        # Move to next batch
+        batch_start=$((batch_end + 1))
     done
+
     local ocr_loop_end=$(date +%s.%N)
     local ocr_loop_time=$(echo "scale=1; ($ocr_loop_end - $ocr_loop_start) * 1000" | bc)
-    echo "     [OCR total: ${ocr_loop_time}ms]"
+    echo "     [Total: ${ocr_loop_time}ms]"
 
     local text_length=$(wc -c < "$text_file" | tr -d ' ')
 
@@ -251,7 +269,7 @@ process_pdf() {
     # Increment result index (page metrics already written in loop)
     OCR_RESULT_INDEX=$((OCR_RESULT_INDEX + 1))
 
-    # Cleanup page images
+    # Cleanup temp directory
     rm -rf "$page_dir"
 }
 
@@ -325,35 +343,38 @@ FILES_FAILED=$(tail -n +2 "$OCR_RESULTS_FILE" | grep -c ',false,' 2>/dev/null ||
 FILES_PROCESSED=${FILES_PROCESSED:-0}
 FILES_FAILED=${FILES_FAILED:-0}
 
-# Build resource_samples array from CSV
-RESOURCE_SAMPLES="[]"
+# Temp files for JSON generation (to avoid sprintf buffer overflow)
+RESOURCE_SAMPLES_JSON="/tmp/resource_samples_${RUN_ID}.json"
+OCR_RESULTS_JSON="/tmp/ocr_results_json_${RUN_ID}.json"
+PAGE_METRICS_JSON_DIR="/tmp/page_metrics_json_${RUN_ID}"
+AVG_TIME_JSON="/tmp/avg_time_${RUN_ID}.json"
+
+mkdir -p "$PAGE_METRICS_JSON_DIR"
+
+# Build resource_samples array - write directly to file
+echo -n "[" > "$RESOURCE_SAMPLES_JSON"
 if [ -f "$SAMPLES_FILE" ]; then
-    RESOURCE_SAMPLES=$(tail -n +2 "$SAMPLES_FILE" | awk -F',' '
-        BEGIN { printf "[" }
+    tail -n +2 "$SAMPLES_FILE" | awk -F',' '
         NF >= 4 && $1 != "" {
             if (NR > 1) printf ","
             printf "{\"timestamp\":%s,\"cpu_percent\":%s,\"memory_mb\":%s,\"memory_percent\":%s}", $1, $2, $3, $4
         }
-        END { printf "]" }
-    ')
+    ' >> "$RESOURCE_SAMPLES_JSON"
 fi
+echo -n "]" >> "$RESOURCE_SAMPLES_JSON"
 
-# Build OCR results with embedded page_metrics (matching Python structure)
-OCR_RESULTS="[]"
-if [ -f "$OCR_RESULTS_FILE" ] && [ -f "$PAGE_METRICS_FILE" ] && [ -f "$SAMPLES_FILE" ]; then
-    OCR_RESULTS=$(awk -F',' '
-    BEGIN {
-        sample_count = 0
-        ocr_count = 0
-    }
-    # First pass: read resource samples
+# Pre-process: correlate page metrics with samples and write to individual files per result_idx
+# This avoids accumulating large strings in memory
+if [ -f "$SAMPLES_FILE" ] && [ -f "$PAGE_METRICS_FILE" ]; then
+    awk -F',' '
+    # First pass: read resource samples into arrays
     FILENAME == ARGV[1] && FNR > 1 {
         sample_count++
         sample_ts[sample_count] = $1
         sample_cpu[sample_count] = $2
         sample_mem[sample_count] = $3
     }
-    # Second pass: read page metrics and correlate with samples
+    # Second pass: process page metrics and write each page JSON to file
     FILENAME == ARGV[2] && FNR > 1 {
         result_idx = $1
         page_num = $3
@@ -378,58 +399,56 @@ if [ -f "$OCR_RESULTS_FILE" ] && [ -f "$PAGE_METRICS_FILE" ] && [ -f "$SAMPLES_F
         avg_cpu = (match_count > 0) ? sum_cpu / match_count : 0
         avg_mem = (match_count > 0) ? sum_mem / match_count : 0
 
-        # Build page metric JSON (output null for metrics when no samples matched)
+        # Write page metric JSON directly to file for this result_idx
+        outfile = "'"$PAGE_METRICS_JSON_DIR"'/" result_idx ".jsonl"
         if (match_count > 0) {
-            page_json = sprintf("{\"page_number\":%d,\"start_timestamp\":%s,\"end_timestamp\":%s,\"processing_time_ms\":%s,\"width\":%s,\"height\":%s,\"text_length\":%s,\"peak_cpu_percent\":%.1f,\"avg_cpu_percent\":%.1f,\"peak_memory_mb\":%.1f,\"avg_memory_mb\":%.1f,\"sample_count\":%d}",
-                page_num, start_ts, end_ts, proc_time, p_width, p_height, text_len, peak_cpu, avg_cpu, peak_mem, avg_mem, match_count)
+            printf "{\"page_number\":%d,\"start_timestamp\":%s,\"end_timestamp\":%s,\"processing_time_ms\":%s,\"width\":%s,\"height\":%s,\"text_length\":%s,\"peak_cpu_percent\":%.1f,\"avg_cpu_percent\":%.1f,\"peak_memory_mb\":%.1f,\"avg_memory_mb\":%.1f,\"sample_count\":%d}\n",
+                page_num, start_ts, end_ts, proc_time, p_width, p_height, text_len, peak_cpu, avg_cpu, peak_mem, avg_mem, match_count >> outfile
         } else {
-            page_json = sprintf("{\"page_number\":%d,\"start_timestamp\":%s,\"end_timestamp\":%s,\"processing_time_ms\":%s,\"width\":%s,\"height\":%s,\"text_length\":%s,\"peak_cpu_percent\":null,\"avg_cpu_percent\":null,\"peak_memory_mb\":null,\"avg_memory_mb\":null,\"sample_count\":0}",
-                page_num, start_ts, end_ts, proc_time, p_width, p_height, text_len)
-        }
-
-        pages[result_idx] = pages[result_idx] (pages[result_idx] ? "," : "") page_json
-    }
-    # Third pass: read OCR results and build final JSON
-    FILENAME == ARGV[3] && FNR > 1 {
-        ocr_count++
-        result_idx = $1
-        filename = $2
-        file_size_kb = $3
-        width = $4
-        height = $5
-        proc_time = $6
-        text_len = $7
-        success = $8
-        page_count = $9
-        error = $10
-
-        # Build page_metrics array for this result
-        page_metrics_json = pages[result_idx] ? pages[result_idx] : ""
-
-        # Store OCR result with embedded page_metrics
-        if (success == "true") {
-            ocr_json[ocr_count] = sprintf("{\"filename\":\"%s\",\"file_size_kb\":%s,\"image_width\":%s,\"image_height\":%s,\"processing_time_ms\":%s,\"text_length\":%s,\"success\":true,\"page_count\":%s,\"error\":null,\"page_metrics\":[%s]}",
-                filename, file_size_kb, width, height, proc_time, text_len, page_count, page_metrics_json)
-        } else {
-            ocr_json[ocr_count] = sprintf("{\"filename\":\"%s\",\"file_size_kb\":%s,\"image_width\":%s,\"image_height\":%s,\"processing_time_ms\":%s,\"text_length\":%s,\"success\":false,\"page_count\":%s,\"error\":\"%s\",\"page_metrics\":null}",
-                filename, file_size_kb, width, height, proc_time, text_len, page_count, error)
+            printf "{\"page_number\":%d,\"start_timestamp\":%s,\"end_timestamp\":%s,\"processing_time_ms\":%s,\"width\":%s,\"height\":%s,\"text_length\":%s,\"peak_cpu_percent\":null,\"avg_cpu_percent\":null,\"peak_memory_mb\":null,\"avg_memory_mb\":null,\"sample_count\":0}\n",
+                page_num, start_ts, end_ts, proc_time, p_width, p_height, text_len >> outfile
         }
     }
-    END {
-        printf "["
-        for (i = 1; i <= ocr_count; i++) {
-            if (i > 1) printf ","
-            printf "%s", ocr_json[i]
-        }
-        printf "]"
-    }
-    ' "$SAMPLES_FILE" "$PAGE_METRICS_FILE" "$OCR_RESULTS_FILE")
+    ' "$SAMPLES_FILE" "$PAGE_METRICS_FILE"
 fi
 
+# Build OCR results array - write each result to a line, then join with commas
+OCR_RESULTS_LINES="/tmp/ocr_results_lines_${RUN_ID}.jsonl"
+> "$OCR_RESULTS_LINES"
+
+if [ -f "$OCR_RESULTS_FILE" ]; then
+    tail -n +2 "$OCR_RESULTS_FILE" | while IFS=',' read -r result_idx filename file_size_kb width height proc_time text_len success page_count error; do
+        # Build page_metrics array from jsonl file
+        page_metrics_file="${PAGE_METRICS_JSON_DIR}/${result_idx}.jsonl"
+        if [ -f "$page_metrics_file" ]; then
+            # Convert jsonl to JSON array (join lines with commas)
+            page_metrics_json=$(paste -sd',' "$page_metrics_file")
+        else
+            page_metrics_json=""
+        fi
+
+        # Output OCR result with embedded page_metrics (one per line)
+        if [ "$success" = "true" ]; then
+            printf '{"filename":"%s","file_size_kb":%s,"image_width":%s,"image_height":%s,"processing_time_ms":%s,"text_length":%s,"success":true,"page_count":%s,"error":null,"page_metrics":[%s]}\n' \
+                "$filename" "$file_size_kb" "$width" "$height" "$proc_time" "$text_len" "$page_count" "$page_metrics_json"
+        else
+            printf '{"filename":"%s","file_size_kb":%s,"image_width":%s,"image_height":%s,"processing_time_ms":%s,"text_length":%s,"success":false,"page_count":%s,"error":"%s","page_metrics":null}\n' \
+                "$filename" "$file_size_kb" "$width" "$height" "$proc_time" "$text_len" "$page_count" "$error"
+        fi
+    done >> "$OCR_RESULTS_LINES"
+fi
+
+# Convert jsonl to JSON array (join lines with commas, wrap in brackets)
+echo -n "[" > "$OCR_RESULTS_JSON"
+if [ -s "$OCR_RESULTS_LINES" ]; then
+    paste -sd',' "$OCR_RESULTS_LINES" >> "$OCR_RESULTS_JSON"
+fi
+echo -n "]" >> "$OCR_RESULTS_JSON"
+
 # Calculate average time per page for each file across iterations
-AVG_TIME_PER_PAGE="[]"
+echo -n "[" > "$AVG_TIME_JSON"
 if [ -f "$FILE_TIMES_FILE" ]; then
-    AVG_TIME_PER_PAGE=$(tail -n +2 "$FILE_TIMES_FILE" | awk -F',' '
+    tail -n +2 "$FILE_TIMES_FILE" | awk -F',' '
         {
             filename[$1] = $1
             sum[$1] += $2
@@ -437,7 +456,6 @@ if [ -f "$FILE_TIMES_FILE" ]; then
             pages[$1] = $3
         }
         END {
-            printf "["
             first = 1
             for (f in filename) {
                 if (!first) printf ","
@@ -445,31 +463,37 @@ if [ -f "$FILE_TIMES_FILE" ]; then
                 avg = sum[f] / count[f]
                 printf "{\"filename\":\"%s\",\"avg_time_per_page_ms\":%.3f,\"total_pages\":%d,\"iterations\":%d}", f, avg, pages[f], count[f]
             }
-            printf "]"
         }
-    ')
+    ' >> "$AVG_TIME_JSON"
 fi
+echo -n "]" >> "$AVG_TIME_JSON"
 
-# Generate final JSON report (matching Python output structure)
-cat > "$RESULTS_FILE" << EOF
+# Generate final JSON report by concatenating files (matching Python output structure)
 {
-  "run_id": "$RUN_ID",
-  "start_time": "$START_TIME_ISO",
-  "end_time": "$END_TIME_ISO",
-  "total_duration_s": $TOTAL_DURATION,
-  "engine": "tesseract-native",
-  "tesseract_version": "$TESSERACT_VERSION",
-  "files_processed": $FILES_PROCESSED,
-  "files_failed": $FILES_FAILED,
-  "ocr_results": $OCR_RESULTS,
-  "resource_samples": $RESOURCE_SAMPLES,
-  "peak_cpu_percent": $PEAK_CPU,
-  "peak_memory_mb": $PEAK_MEM,
-  "avg_cpu_percent": $AVG_CPU,
-  "avg_memory_mb": $AVG_MEM,
-  "avg_time_per_page": $AVG_TIME_PER_PAGE
-}
-EOF
+    echo "{"
+    echo "  \"run_id\": \"$RUN_ID\","
+    echo "  \"start_time\": \"$START_TIME_ISO\","
+    echo "  \"end_time\": \"$END_TIME_ISO\","
+    echo "  \"total_duration_s\": $TOTAL_DURATION,"
+    echo "  \"engine\": \"tesseract-native\","
+    echo "  \"tesseract_version\": \"$TESSERACT_VERSION\","
+    echo "  \"files_processed\": $FILES_PROCESSED,"
+    echo "  \"files_failed\": $FILES_FAILED,"
+    echo -n "  \"ocr_results\": "
+    cat "$OCR_RESULTS_JSON"
+    echo ","
+    echo -n "  \"resource_samples\": "
+    cat "$RESOURCE_SAMPLES_JSON"
+    echo ","
+    echo "  \"peak_cpu_percent\": $PEAK_CPU,"
+    echo "  \"peak_memory_mb\": $PEAK_MEM,"
+    echo "  \"avg_cpu_percent\": $AVG_CPU,"
+    echo "  \"avg_memory_mb\": $AVG_MEM,"
+    echo -n "  \"avg_time_per_page\": "
+    cat "$AVG_TIME_JSON"
+    echo ""
+    echo "}"
+} > "$RESULTS_FILE"
 
 echo ""
 echo "[Benchmark] === Results ==="
@@ -484,4 +508,5 @@ echo "  Results saved to: $RESULTS_FILE"
 
 # Cleanup temp files
 rm -f "$SAMPLES_FILE" "$OCR_RESULTS_FILE" "$FILE_TIMES_FILE" "$PAGE_METRICS_FILE" "/tmp/stop_monitor_${RUN_ID}"
-rm -rf "$PDF_TEMP_DIR"
+rm -f "$RESOURCE_SAMPLES_JSON" "$OCR_RESULTS_JSON" "$OCR_RESULTS_LINES" "$AVG_TIME_JSON"
+rm -rf "$PDF_TEMP_DIR" "$PAGE_METRICS_JSON_DIR"
