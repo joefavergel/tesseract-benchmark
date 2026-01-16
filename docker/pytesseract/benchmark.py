@@ -111,11 +111,22 @@ class ResourceMonitor:
     def _sample_loop(self):
         while self._running:
             try:
+                # Main process metrics
                 cpu = self._process.cpu_percent()
-                mem_info = self._process.memory_info()
-                mem_mb = mem_info.rss / (1024 * 1024)
-                mem_percent = self._process.memory_percent()
-                
+                mem = self._process.memory_info().rss
+
+                # Include child processes (Tesseract subprocesses)
+                for child in self._process.children(recursive=True):
+                    try:
+                        cpu += child.cpu_percent()
+                        mem += child.memory_info().rss
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+
+                mem_mb = mem / (1024 * 1024)
+                total_mem = psutil.virtual_memory().total
+                mem_percent = (mem / total_mem) * 100
+
                 self.samples.append(ResourceSample(
                     timestamp=time.time(),
                     cpu_percent=cpu,
@@ -124,7 +135,7 @@ class ResourceMonitor:
                 ))
             except Exception as e:
                 print(f"[Monitor] Error sampling: {e}", file=sys.stderr)
-            
+
             time.sleep(self.interval)
 
 
